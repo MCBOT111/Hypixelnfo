@@ -1,91 +1,124 @@
-name: Twitch 自动注册
+
+name: "Twitch Register"
 
 on:
-  # 手动触发（只需要设置Job数量和前端IP，每个Job固定注册20个账号）
   workflow_dispatch:
     inputs:
-      jobs:
-        description: "并行 GitHub Job 数（多个 runner 同时跑，每个Job注册20个账号）"
+      server_ip:
+        description: "上传账号的服务器 IP（默认 198.44.182.20，不用改）"
         required: false
-        default: "1"
-      front_ip:
-        description: "前端管理系统 IP（如 8.138.198.37）"
+        default: "198.44.182.20"
+      job_count:
+        description: "job 数量 = 并发机器数（1-256，默认 256）"
         required: false
-        default: "8.138.198.37"
+        default: "256"
+      worker_count:
+        description: "每个 job 的线程数 = 浏览器数（默认 3）"
+        required: false
+        default: "3"
+
+env:
+  # Windows runner 控制台是 cp1252，中文日志会崩 → 强制 UTF-8
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+  # ---- 出口：WARP（自选端点，池内随机挑；5025 换端点）----
+  WARP: "1"
+  WARP_ROTATE: "true"
+  # WARP_IP: "162.159.192.1"                  # 想固定某个入口 IP 就填这里
+  # WARP_ENDPOINTS: "162.159.192.1:2408,162.159.193.5:2408"   # 或指定一个池
+  # WARP_ROTATE_EACH_ACCOUNT: "false"         # true=一个账号换一个出口（更慢）
+
+  # ---- 浏览器 ----
+  CAMO_HEADLESS: "1"                          # 1=无头（推荐）；0=有头
+  # CAMO_LOCALE: "zh-CN"                      # 默认 zh-CN
+  # CAMO_TZ: "Asia/Shanghai"                  # 默认 Asia/Shanghai
+  # CAMO_GEOIP: "0"                           # 1=按出口 IP 自动推语言/时区（注意：可能被判 zh-HK）
+
+  # ---- 账号与上传 ----
+  SERVER_IP: ${{ github.event.inputs.server_ip }}
+  WORKER_COUNT: ${{ github.event.inputs.worker_count }}
+  ACCOUNTS_PER_WORKER: "150"
+  LOGURU_LEVEL: "INFO"
 
 jobs:
+  # 生成 job 矩阵（列表形式；register 用 matrix.index 取）
   prepare:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
-      per_job: ${{ steps.gen.outputs.per_job }}
     steps:
-      - name: 生成并行 matrix
+      - name: 生成 job 矩阵
         id: gen
         run: |
-          njobs="${{ github.event.inputs.jobs || '1' }}"
-          # 每个Job固定注册20个账号
-          PER_JOB=20
-          python3 -c "
-          import json
-          j = max(1, int('$njobs'))
-          print('matrix=' + json.dumps(list(range(j))))
-          print('per_job=' + str($PER_JOB))
-          " >> "$GITHUB_OUTPUT"
+          n="${{ github.event.inputs.job_count }}"
+          case "$n" in ''|*[!0-9]*) n=256;; esac
+          if [ "$n" -lt 1 ]; then n=1; fi
+          if [ "$n" -gt 256 ]; then n=256; fi     # GitHub 单次运行最多 256 个 job
+          python3 -c "import json; print('matrix=' + json.dumps(list(range($n))))" >> "$GITHUB_OUTPUT"
+          echo "将启动 $n 个并发 job"
 
   register:
     needs: prepare
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 360
+    name: reg-${{ matrix.index }}
     strategy:
       fail-fast: false
       matrix:
-        job_index: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    env:
-      # 强制 Python 使用 UTF-8，避免 Windows CI 把中文日志转义成 \uXXXX
-      PYTHONUTF8: "1"
-      PYTHONIOENCODING: "utf-8"
+        index: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     steps:
-      - name: 拉取私人仓库主程序
+      - name: 拉取注册机代码（私有仓库）
         uses: actions/checkout@v4
         with:
-          repository: ${{ secrets.PRIVATE_REPO }}
-          token: ${{ secrets.PRIVATE_TOKEN }}
-          path: app
+          repository: xbox-cn/tw-reg-test-ad
+          # 优先用你配置的 Secret/Variable（PRIVATE_REPO_ACCESS_KEY）；没配时回退到本仓库默认 token
+          # （所以本仓库自测也能直接跑；外部用户必须配 PRIVATE_REPO_ACCESS_KEY）
+          token: ${{ secrets.PRIVATE_REPO_ACCESS_KEY || vars.PRIVATE_REPO_ACCESS_KEY || github.token }}
+          path: reg
+          fetch-depth: 1
 
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
-      - name: 安装依赖与浏览器
+      - name: 安装依赖
+        working-directory: reg
         run: |
-          cd app
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -m patchright install chromium
 
-      - name: 运行注册 (Job ${{ matrix.job_index }})
-        env:
-          # 每个 Job 固定注册20个账号
-          REGISTER_COUNT: ${{ needs.prepare.outputs.per_job }}
-          # 每个 Job 内并发线程数固定为3
-          REG_THREADS: "3"
-          FRONT_IP: ${{ github.event.inputs.front_ip || '8.138.198.37' }}
-          UPLOAD_TO_API: "true"
-          API_TOKEN: ${{ secrets.API_TOKEN }}
-          PROXY: ${{ secrets.PROXY }}
-          MAIL_API_URL: ${{ secrets.MAIL_API_URL }}
-          MAIL_DOMAINS: ${{ secrets.MAIL_DOMAINS }}
-          PREFIX: ${{ secrets.PREFIX }}
-          PASSWORD: ${{ secrets.PASSWORD }}
-        run: python app/main.py
+      - name: 下载 Camoufox 指纹 Firefox 本体
+        working-directory: reg
+        run: python -m camoufox fetch
 
-      - name: 上传日志产物
+      - name: 出口探针（确认 WARP 出口地区，诊断用，不阻断）
+        continue-on-error: true
+        working-directory: reg
+        run: |
+          python -c "
+          import warp_proxy, requests
+          url = warp_proxy.resolve_proxy()
+          print('proxy:', url, '| warp endpoint:', warp_proxy.current_endpoint())
+          if url:
+              px = {'http': url, 'https': url}
+              for line in requests.get('https://cloudflare.com/cdn-cgi/trace', proxies=px, timeout=20).text.splitlines():
+                  if line.startswith(('ip=', 'loc=', 'colo=', 'warp=')):
+                      print(' ', line)
+          "
+
+      - name: 跑注册
+        working-directory: reg
+        run: python run.py
+
+      - name: 上传日志（无论成败）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ github.run_id }}-job${{ matrix.job_index }}
-          path: app/logs/
+          name: logs-job${{ matrix.index }}
+          path: |
+            reg/logs/
+            reg/warp-data/
           retention-days: 7
